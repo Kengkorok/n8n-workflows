@@ -1,0 +1,223 @@
+{
+  "name": "Maybank Statement → Actual Budget",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// Sediakan PDF base64 dari binary attachment Gmail\n// n8n 2.x guna filesystem-v2 binary mode — mesti guna getBinaryDataBuffer\n// (item.binary.attachment_0.data cuma pointer \"filesystem-v2\", bukan data!)\n\nconst items = $input.all();\nconst results = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const binary = item.binary || {};\n  const keys = Object.keys(binary);\n  if (keys.length === 0) continue;\n\n  // Cari attachment PDF (biasanya statement)\n  for (const k of keys) {\n    const b = binary[k];\n    if (!b) continue;\n    const name = (b.fileName || k).toLowerCase();\n    const isPdf = b.mimeType === 'application/pdf' || name.endsWith('.pdf');\n    if (isPdf) {\n      // Fungsi rasmi n8n untuk dapat binary buffer sebenar\n      const buffer = await this.helpers.getBinaryDataBuffer(i, k);\n      results.push({\n        json: {\n          pdf_base64: buffer.toString('base64'),   // base64 sebenar\n          bank: 'maybank',\n          accountId: '<ACCOUNT_ID>',\n          filename: b.fileName || k\n        }\n      });\n      break;\n    }\n  }\n}\n\nif (results.length === 0) {\n  throw new Error('No PDF attachment found in email');\n}\n\nreturn results;"
+      },
+      "name": "Prepare PDF Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        288,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "<BRIDGE_URL>/extract",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ pdf_base64: $json.pdf_base64, bank: $json.bank }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 180000
+        }
+      },
+      "name": "Extract via Bridge",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        512,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "<HEADER_AUTH_CREDENTIAL_ID>",
+          "name": "Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map hasil /extract (JSON transaksi) ke format Actual Budget\nconst extracted = $json.transactions || [];\nif (extracted.length === 0) {\n  throw new Error('No transactions extracted from statement');\n}\n\n// Account ID Maybank (dari /accounts)\nconst accountId = '<ACCOUNT_ID>';\n\n// Tukar RM (float) ke sen (integer) — Actual guna integer cents\n// amount positif = masuk (deposit), negatif = keluar (withdrawal)\nconst transactions = extracted.map(tx => {\n  const amountSen = Math.round((tx.amount || 0) * 100);\n  return {\n    date: tx.date,\n    amount: amountSen,\n    payee_name: tx.description || 'Unknown',\n    // imported_id: gabungan tarikh+amount+description utk dedup\n    imported_id: [tx.date, Math.abs(amountSen), (tx.description || '').replace(/\\s+/g, '_')].join('-'),\n    notes: tx.balance_after != null ? 'Balance: ' + tx.balance_after : undefined\n  };\n});\n\nreturn [{\n  json: {\n    accountId,\n    transactions\n  }\n}];"
+      },
+      "name": "Map to Actual Format",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        736,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "<BRIDGE_URL>/transactions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ accountId: $json.accountId, transactions: $json.transactions }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "name": "Push to Actual",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "<HEADER_AUTH_CREDENTIAL_ID>",
+          "name": "Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Nota: workflow selesai. Log hasil untuk rujukan.\nconst result = $json;\nreturn [{\n  json: {\n    imported: result.added ? result.added.length : 0,\n    updated: result.updated ? result.updated.length : 0,\n    errors: result.errors || [],\n    message: 'Statement imported to Actual Budget'\n  }\n}];"
+      },
+      "name": "Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1184,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            },
+            {
+              "hour": null,
+              "minute": 5
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "from:m2u@stmts.maybank2u.com.my subject:Statement has:attachment"
+        },
+        "options": {
+          "dataPropertyAttachmentsPrefixName": "attachment_",
+          "downloadAttachments": true
+        }
+      },
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        64,
+        0
+      ],
+      "name": "Gmail Trigger1",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "<GMAIL_OAUTH_CREDENTIAL_ID>",
+          "name": "Gmail account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Prepare PDF Payload": {
+      "main": [
+        [
+          {
+            "node": "Extract via Bridge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract via Bridge": {
+      "main": [
+        [
+          {
+            "node": "Map to Actual Format",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map to Actual Format": {
+      "main": [
+        [
+          {
+            "node": "Push to Actual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push to Actual": {
+      "main": [
+        [
+          {
+            "node": "Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Trigger1": {
+      "main": [
+        [
+          {
+            "node": "Prepare PDF Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "versionId": "scrubbed-public-export",
+  "pinData": {}
+}

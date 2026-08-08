@@ -1,0 +1,19 @@
+# Environment / secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+
+# n8n exports / scratch
+*.tmp
+tmp/
